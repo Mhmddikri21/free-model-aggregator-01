@@ -1,4 +1,4 @@
-import { isRecord, type Json } from './providers.ts';
+import { isRecord, type AuthScheme, type Json } from './providers.ts';
 import { sseEvent } from './wire.ts';
 
 type AnyRecord = Record<string, unknown>;
@@ -873,13 +873,16 @@ export async function callGemini(
 export async function callAnthropic(
   base: string,
   key: string,
+  auth: AuthScheme,
   body: Json,
 ): Promise<Response> {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     'anthropic-version': '2023-06-01',
   };
-  if (key) headers['x-api-key'] = key;
+  if (key && auth === 'bearer') headers.authorization = `Bearer ${key}`;
+  else if (key && auth === 'x-api-key') headers['x-api-key'] = key;
+  else if (key && auth === 'x-goog-api-key') headers['x-goog-api-key'] = key;
 
   return fetch(`${base.replace(/\/+$/, '')}/v1/messages`, {
     method: 'POST',
