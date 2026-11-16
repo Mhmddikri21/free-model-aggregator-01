@@ -323,6 +323,9 @@ async function serve(
   const requestedModel = typeof body.model === 'string' && body.model !== '' ? body.model : 'auto';
   const candidates = candidatesFor(requires, clientWire, jsonMode);
   for (const candidate of candidates) {
+    // A 402 earlier in this request exhausted this provider: do not spend
+    // another call on its remaining models.
+    if (exhausted.has(candidate.probe.provider.id)) continue;
     let upstream: Response;
     try {
       upstream = await callCandidate(candidate, clientWire, body, stream);
