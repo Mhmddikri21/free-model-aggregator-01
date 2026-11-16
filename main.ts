@@ -1,10 +1,13 @@
 // free-model-aggregator-01 entry: one server, two client wires, a directory of free providers.
 //
 // Routing: every request goes to a free model that meets its requirements, chosen
-// inside a rating band of the best (10 milli on a weight-2 request, 25 otherwise)
+// inside a rating band of the best (10 milli on a weight-2 request, 45 otherwise)
 // from the provider with the fewest calls used so far — spreading the load keeps
 // every provider inside its free-tier budget and dodges most of its scheduled
-// failures. A refusal's own error message says whether it is permanent ('budget is
+// failures. A provider is never called past its call cap, so a spent-budget
+// refusal can never happen — except as a last resort: if every eligible provider
+// is at its cap, the best capped one is tried rather than failing the request.
+// A refusal's own error message says whether it is permanent ('budget is
 // spent', an outage, a 401): a permanent refusal blacklists that provider for the
 // trial, a transient one ('refused this call') only moves to the next candidate.
 // Ties break toward the higher rating, then provider id, then model id — fully
@@ -173,19 +176,33 @@ function candidatesFor(
   tried: ReadonlySet<string>,
 ): Candidate[] {
   const out: Candidate[] = [];
+  const capped: Candidate[] = [];
   for (const probe of probes) {
     if (!probe.ok || exhausted.has(probe.provider.id)) continue;
-    if ((callsUsed.get(probe.provider.id) ?? 0) >= (PROVIDER_CALL_CAP[probe.provider.id] ?? 4)) continue;
+    const atCap =
+      (callsUsed.get(probe.provider.id) ?? 0) >= (PROVIDER_CALL_CAP[probe.provider.id] ?? 4);
     if (clientWire === 'openai' && jsonMode && probe.provider.wire === 'anthropic') continue;
     for (const model of probe.models) {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
       if (!modelFree(model, row)) continue;
       if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
       if (tried.has(`${probe.provider.id}/${model.id}`)) continue;
-      out.push({ probe, model, rating: row?.rating_milli ?? 0 });
+      (atCap ? capped : out).push({ probe, model, rating: row?.rating_milli ?? 0 });
     }
   }
-  if (out.length === 0) return [];
+  if (out.length === 0) {
+    // Last resort: every eligible provider is at its call cap. Try the best
+    // capped one rather than failing a request that an upstream could serve.
+    // A permanent refusal blacklists it on the next recompute, so serve still
+    // walks the capped list instead of looping on one provider.
+    capped.sort(
+      (a, b) =>
+        b.rating - a.rating ||
+        (a.probe.provider.id < b.probe.provider.id ? -1 : a.probe.provider.id > b.probe.provider.id ? 1 : 0) ||
+        (a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0),
+    );
+    return capped;
+  }
   const best = out.reduce((rating, candidate) => Math.max(rating, candidate.rating), Number.NEGATIVE_INFINITY);
   const band = weight === 2 ? 10 : 45;
   const kept = out.filter((candidate) => candidate.rating >= best - band);
