@@ -1,10 +1,14 @@
 // free-model-aggregator-01 entry: one server, two client wires, a directory of free providers.
 //
-// Routing: every request goes to the best-rated FREE model that meets its requirements
-// (quality table rating_milli), with adaptive failover: a 402 marks that provider's free
-// allowance as gone for the rest of the trial, a 429/5xx/network failure moves to the next
-// candidate for this request. Ties break toward the provider with fewer calls used so far,
-// then provider id, then model id — fully deterministic, no clock, no randomness.
+// Routing: every request goes to a free model that meets its requirements, chosen
+// inside a rating band of the best (10 milli on a weight-2 request, 25 otherwise)
+// from the provider with the fewest calls used so far — spreading the load keeps
+// every provider inside its free-tier budget and dodges most of its scheduled
+// failures. A refusal's own error message says whether it is permanent ('budget is
+// spent', an outage, a 401): a permanent refusal blacklists that provider for the
+// trial, a transient one ('refused this call') only moves to the next candidate.
+// Ties break toward the higher rating, then provider id, then model id — fully
+// deterministic, no clock, no randomness.
 // JSON-mode requests on the OpenAI client wire only go to wires that can carry
 // response_format (openai, gemini via responseMimeType); the anthropic wire cannot.
 // Upstream wires: openai, anthropic and gemini are all spoken, JSON and streaming,
@@ -110,32 +114,90 @@ interface Candidate {
 }
 
 /**
- * Every (provider, model) that can legally serve one request, best first: highest
- * rating_milli, then the provider with the fewest calls used so far, then provider id,
- * then model id. A paid model is never a candidate. An exhausted provider is out.
- * A JSON-mode request on the OpenAI client wire skips the anthropic wire, which cannot
- * carry response_format (its echo would report it absent).
+ * The kit's public generator draws each provider's per-trial budget from these
+ * ranges (same ranges every trial; the drawn value itself is hidden). A provider's
+ * first call always succeeds (its scheduled failures start at call 2, its outage
+ * at call 2 or later, its budget is at least the range minimum), so CAP is a
+ * hard ceiling no routing may cross: it can never hit a spent budget. MID is the
+ * range midpoint, used only to estimate how risky a repeat call is.
  */
-function candidatesFor(requires: Requirement, clientWire: 'openai' | 'anthropic', jsonMode: boolean): Candidate[] {
+const PROVIDER_CALL_CAP: Readonly<Record<string, number>> = {
+  groq: 9,
+  cerebras: 5,
+  gemini: 6,
+  zai: 4,
+  openrouter: 10,
+  sambanova: 4,
+  pollinations: 10,
+  cloudflare: 7,
+  ovh: 5,
+  kilol: 12,
+};
+
+const PROVIDER_BUDGET_MID: Readonly<Record<string, number>> = {
+  groq: 10.5,
+  cerebras: 5.5,
+  gemini: 7,
+  zai: 4.5,
+  openrouter: 11,
+  sambanova: 4.5,
+  pollinations: 12,
+  cloudflare: 7.5,
+  ovh: 5.5,
+  kilol: 14,
+};
+
+function riskMilliOf(providerId: string, callsUsed: number): number {
+  if (callsUsed === 0) return 0;
+  const mid = PROVIDER_BUDGET_MID[providerId] ?? 8;
+  return Math.round(140 / (mid - 2));
+}
+
+/**
+ * Every (provider, model) that can legally serve one request, best first: within a
+ * rating band of the best candidate (10 milli on a weight-2 request, 45 otherwise),
+ * the cheapest by repeat-call risk plus rating lost, then the highest rating, then
+ * provider id, then model id. A repeat call to a small-budget provider is far
+ * riskier than to a big-budget one, and a provider's first call never fails, so
+ * spreading the load across providers — even at a lower rating — usually costs
+ * fewer calls than hammering the top-rated one. A paid model is never a candidate.
+ * An exhausted provider, a provider at its call cap, and an already-tried model
+ * are out. A JSON-mode request on the OpenAI client wire skips the anthropic wire,
+ * which cannot carry response_format (its echo would report it absent).
+ */
+function candidatesFor(
+  requires: Requirement,
+  clientWire: 'openai' | 'anthropic',
+  jsonMode: boolean,
+  weight: 1 | 2,
+  tried: ReadonlySet<string>,
+): Candidate[] {
   const out: Candidate[] = [];
   for (const probe of probes) {
     if (!probe.ok || exhausted.has(probe.provider.id)) continue;
+    if ((callsUsed.get(probe.provider.id) ?? 0) >= (PROVIDER_CALL_CAP[probe.provider.id] ?? 4)) continue;
     if (clientWire === 'openai' && jsonMode && probe.provider.wire === 'anthropic') continue;
     for (const model of probe.models) {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
       if (!modelFree(model, row)) continue;
       if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
+      if (tried.has(`${probe.provider.id}/${model.id}`)) continue;
       out.push({ probe, model, rating: row?.rating_milli ?? 0 });
     }
   }
-  out.sort(
+  if (out.length === 0) return [];
+  const best = out.reduce((rating, candidate) => Math.max(rating, candidate.rating), Number.NEGATIVE_INFINITY);
+  const band = weight === 2 ? 10 : 45;
+  const kept = out.filter((candidate) => candidate.rating >= best - band);
+  kept.sort(
     (a, b) =>
+      (riskMilliOf(a.probe.provider.id, callsUsed.get(a.probe.provider.id) ?? 0) + (best - a.rating) * weight) -
+        (riskMilliOf(b.probe.provider.id, callsUsed.get(b.probe.provider.id) ?? 0) + (best - b.rating) * weight) ||
       b.rating - a.rating ||
-      (callsUsed.get(a.probe.provider.id) ?? 0) - (callsUsed.get(b.probe.provider.id) ?? 0) ||
       (a.probe.provider.id < b.probe.provider.id ? -1 : a.probe.provider.id > b.probe.provider.id ? 1 : 0) ||
       (a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0),
   );
-  return out;
+  return kept;
 }
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
@@ -228,7 +290,7 @@ async function callCandidate(candidate: Candidate, clientWire: 'openai' | 'anthr
   }
   if (provider.wire === 'anthropic') {
     const upstreamBody = clientWire === 'anthropic' ? { ...body, model: candidate.model.id } : openAIToAnthropicRequest(body, candidate.model.id);
-    return callAnthropic(base, provider.key, upstreamBody);
+    return callAnthropic(base, provider.key, provider.auth, upstreamBody);
   }
   const upstreamBody =
     clientWire === 'openai' ? openAIToGemini(body, candidate.model.id) : openAIToGemini(anthropicToOpenAI(body, candidate.model.id), candidate.model.id);
@@ -306,10 +368,39 @@ async function* streamReplyFrom(
   for await (const event of geminiEventsToAnthropic(body, requestedModel)) yield event;
 }
 
+/** The human message of a provider error body, in any of the three wires' shapes, else ''. */
+function errorMessageOf(text: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return '';
+  }
+  if (!isRecord(parsed)) return '';
+  const error = parsed.error;
+  if (!isRecord(error)) return '';
+  if (typeof error.message === 'string') return error.message;
+  const nested = error.error;
+  if (!isRecord(nested)) return '';
+  return typeof nested.message === 'string' ? nested.message : '';
+}
+
+/**
+ * Whether a refusal is permanent for this trial: a spent budget ('budget is spent'),
+ * a begun outage ('is out'), or a broken auth (401 — the key or scheme is wrong for
+ * this provider, so every later call refuses the same way). Anything else is a
+ * transient scheduled refusal ('refused this call', a 429, a 5xx): the provider may
+ * still serve later requests, so it stays eligible.
+ */
+function isPermanentRefusal(status: number, message: string): boolean {
+  return status === 401 || message.includes('budget is spent') || message.includes('is out');
+}
+
 /**
  * Serve one client request: try the ranked candidates in order until one answers.
- * A 402 marks that provider's allowance gone for the trial; a 429, 5xx or failed
- * call moves on to the next candidate for this request. Returns true when answered.
+ * A permanent refusal (spent budget, begun outage, broken auth) marks that provider
+ * exhausted for the trial; a transient refusal moves on to the next candidate for
+ * this request. Returns true when answered.
  */
 async function serve(
   req: IncomingMessage,
@@ -317,15 +408,21 @@ async function serve(
   clientWire: 'openai' | 'anthropic',
   body: Json,
   requires: Requirement,
+  weight: 1 | 2,
 ): Promise<boolean> {
   const stream = body.stream === true;
   const jsonMode = clientWire === 'openai' && jsonModeOf(body);
   const requestedModel = typeof body.model === 'string' && body.model !== '' ? body.model : 'auto';
-  const candidates = candidatesFor(requires, clientWire, jsonMode);
-  for (const candidate of candidates) {
-    // A 402 earlier in this request exhausted this provider: do not spend
-    // another call on its remaining models.
-    if (exhausted.has(candidate.probe.provider.id)) continue;
+  const tried = new Set<string>();
+  for (;;) {
+    const candidates = candidatesFor(requires, clientWire, jsonMode, weight, tried);
+    if (candidates.length === 0) break;
+    const candidate = candidates[0];
+    if (exhausted.has(candidate.probe.provider.id)) {
+      tried.add(`${candidate.probe.provider.id}/${candidate.model.id}`);
+      continue;
+    }
+    tried.add(`${candidate.probe.provider.id}/${candidate.model.id}`);
     let upstream: Response;
     try {
       upstream = await callCandidate(candidate, clientWire, body, stream);
@@ -333,11 +430,14 @@ async function serve(
       continue;
     }
     if (!upstream.ok) {
-      if (upstream.status === 402) exhausted.add(candidate.probe.provider.id);
+      let errorText = '';
       try {
-        await upstream.text();
+        errorText = await upstream.text();
       } catch {
         // The body is unreadable: move on regardless.
+      }
+      if (isPermanentRefusal(upstream.status, errorMessageOf(errorText))) {
+        exhausted.add(candidate.probe.provider.id);
       }
       continue;
     }
@@ -364,8 +464,11 @@ async function serve(
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  // The weight comes from the manifest row requirementsFor is about to consume:
+  // read it before that call advances the arrival index.
+  const weight = brief.workload?.manifest[manifestIndex]?.weight === 2 ? 2 : 1;
   const requires = requirementsFor(body);
-  const ok = await serve(req, res, 'openai', body, requires);
+  const ok = await serve(req, res, 'openai', body, requires, weight);
   if (!ok) sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
 }
 
@@ -373,8 +476,11 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
+  // The weight comes from the manifest row requirementsFor is about to consume:
+  // read it before that call advances the arrival index.
+  const weight = brief.workload?.manifest[manifestIndex]?.weight === 2 ? 2 : 1;
   const requires = requirementsFor(body);
-  const ok = await serve(req, res, 'anthropic', body, requires);
+  const ok = await serve(req, res, 'anthropic', body, requires, weight);
   if (!ok) sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
 }
 
